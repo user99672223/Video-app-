@@ -1,0 +1,81 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server-sanity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile
+        run: python3 -m py_compile server/atvcast.py
+      - name: ffprobe decision logic sanity check
+        run: |
+          SAMPLE=$(ls samples/* 2>/dev/null | head -n1 || true)
+          if [ -n "$SAMPLE" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+            python3 server/atvcast.py --selftest --sample "$SAMPLE"
+          else
+            python3 server/atvcast.py --selftest
+          fi
+
+  tvos:
+    runs-on: macos-latest
+    env:
+      DERIVED_DATA: ${{ github.workspace }}/DerivedData
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Cache DerivedData
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/DerivedData
+          key: dd-${{ runner.os }}-${{ hashFiles('project.yml', 'TVApp/**') }}
+          restore-keys: |
+            dd-${{ runner.os }}-
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project TVApp.xcodeproj \
+            -scheme TVApp \
+            -configuration Release \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath "$DERIVED_DATA" \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM=""
+
+      - name: Package unsigned IPA
+        run: |
+          APP="$DERIVED_DATA/Build/Products/Release-appletvos/TVApp.app"
+          test -d "$APP" || { echo "app not found at $APP"; find "$DERIVED_DATA/Build/Products" -maxdepth 3 -name '*.app'; exit 1; }
+          rm -rf Payload TVApp-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry TVApp-unsigned.ipa Payload
+          ls -lh TVApp-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TVApp-unsigned-ipa
+          path: TVApp-unsigned.ipa
+          if-no-files-found: error
