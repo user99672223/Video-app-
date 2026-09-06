@@ -71,10 +71,13 @@ jobs:
           test -f "$APP/TVApp" || { echo "no executable in bundle"; exit 1; }
           plutil -p "$APP/Info.plist"
           # ATS off is what lets the Apple TV load plain HTTP from a LAN IP.
-          plutil -p "$APP/Info.plist" | grep -q '"NSAllowsArbitraryLoads" => 1' \
-            || { echo "NSAppTransportSecurity/NSAllowsArbitraryLoads missing"; exit 1; }
-          plutil -p "$APP/Info.plist" | grep -q 'NSLocalNetworkUsageDescription' \
-            || { echo "NSLocalNetworkUsageDescription missing"; exit 1; }
+          # plutil -extract exits non-zero when the key is absent.
+          ATS=$(plutil -extract NSAppTransportSecurity.NSAllowsArbitraryLoads raw -o - "$APP/Info.plist")
+          case "$ATS" in
+            true|1|YES) ;;
+            *) echo "NSAllowsArbitraryLoads is '$ATS', expected true"; exit 1 ;;
+          esac
+          plutil -extract NSLocalNetworkUsageDescription raw -o - "$APP/Info.plist" >/dev/null
 
       - name: Package unsigned IPA
         run: |
