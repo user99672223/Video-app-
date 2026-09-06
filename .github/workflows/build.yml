@@ -64,10 +64,21 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM=""
 
-      - name: Package unsigned IPA
+      - name: Verify bundle
         run: |
           APP="$DERIVED_DATA/Build/Products/Release-appletvos/TVApp.app"
           test -d "$APP" || { echo "app not found at $APP"; find "$DERIVED_DATA/Build/Products" -maxdepth 3 -name '*.app'; exit 1; }
+          test -f "$APP/TVApp" || { echo "no executable in bundle"; exit 1; }
+          plutil -p "$APP/Info.plist"
+          # ATS off is what lets the Apple TV load plain HTTP from a LAN IP.
+          plutil -p "$APP/Info.plist" | grep -q '"NSAllowsArbitraryLoads" => 1' \
+            || { echo "NSAppTransportSecurity/NSAllowsArbitraryLoads missing"; exit 1; }
+          plutil -p "$APP/Info.plist" | grep -q 'NSLocalNetworkUsageDescription' \
+            || { echo "NSLocalNetworkUsageDescription missing"; exit 1; }
+
+      - name: Package unsigned IPA
+        run: |
+          APP="$DERIVED_DATA/Build/Products/Release-appletvos/TVApp.app"
           rm -rf Payload TVApp-unsigned.ipa
           mkdir -p Payload
           cp -R "$APP" Payload/
