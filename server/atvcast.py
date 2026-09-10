@@ -9,16 +9,17 @@ Stdlib only. Requires ffmpeg/ffprobe on PATH.
 from __future__ import annotations
 
 import argparse
-import html
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
@@ -68,6 +69,58 @@ CHARENC_FFMPEG = {"utf-8": "UTF-8", "utf-8-sig": "UTF-8", "cp1252": "CP1252", "l
 SRT_ENCODING_ORDER = ["utf-8", "cp1252", "latin-1"]
 
 CHUNK = 256 * 1024
+
+CONFIG_DIR = os.path.expanduser("~/.config/atvcast")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+DEFAULT_PORT = 8080
+
+
+# --------------------------------------------------------------------------
+# Config / networking helpers
+# --------------------------------------------------------------------------
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg: dict):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def free_port(preferred: int) -> int:
+    """First bindable port at or after `preferred`, so a stale instance or a
+    busy 8080 does not stop the app from launching."""
+    for port in range(preferred, preferred + 25):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", port))
+                return port
+            except OSError:
+                continue
+    return preferred
+
+
+def lan_ip() -> str:
+    """The address the Apple TV should use. No packet is actually sent."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 # --------------------------------------------------------------------------
@@ -201,12 +254,30 @@ def analyze(probe: dict, audio_sel=None, sub_sel=None) -> dict:
             "width": video.get("width"),
             "height": video.get("height"),
             "color": color_tags(video),
+            "tag": video_tag(video),
         },
         "audio": audio,
         "subs": subs,
         "dropped_subs": dropped,
         "warnings": warnings,
     }
+
+
+def video_tag(stream: dict) -> str | None:
+    """MP4 sample-entry fourcc Apple players require.
+
+    ffmpeg's mp4 muxer writes `hev1` for copied HEVC, which the Apple TV will
+    not decode. It needs `hvc1` (parameter sets in the sample entry), or `dvh1`
+    when the stream carries a Dolby Vision RPU. h264 already muxes as avc1.
+    """
+    codec = (stream.get("codec_name") or "").lower()
+    if codec != "hevc":
+        return None
+    for sd in (stream.get("side_data_list") or []):
+        kind = str(sd.get("side_data_type") or "").lower()
+        if "dovi" in kind or "dolby vision" in kind:
+            return "dvh1"
+    return "hvc1"
 
 
 def color_tags(stream: dict) -> dict:
@@ -301,6 +372,8 @@ def build_command(source: str, plan: dict, out_path: str, ext_subs: list,
         cmd += ["-map", "%d:0" % (i + 1)]
 
     cmd += ["-c:v", "copy"]
+    if plan["video"].get("tag"):
+        cmd += ["-tag:v", plan["video"]["tag"]]
 
     for oi, a in enumerate(audio):
         if a["action"] == "copy":
@@ -562,6 +635,8 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/api/convert":
             return self.api_convert()
+        if u.path == "/api/config":
+            return self.api_set_config()
         return self._err(404, "not found")
 
     def _route(self):
@@ -575,6 +650,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.api_browse(q)
             if path == "/api/probe":
                 return self.api_probe(q)
+            if path == "/api/config":
+                return self.api_get_config()
             if path == "/api/jobs":
                 return self._json({"items": self.server.store.all()})
             if path == "/library":
@@ -591,6 +668,32 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     # -- api --------------------------------------------------------------
+    def api_get_config(self):
+        return self._json({
+            "media": self.server.media_root,
+            "cache": self.server.store.cache,
+            "port": self.server.server_address[1],
+            "appletv_url": "http://%s:%d" % (lan_ip(), self.server.server_address[1]),
+            "home": os.path.expanduser("~"),
+        })
+
+    def api_set_config(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            req = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return self._err(400, "bad json")
+        media = os.path.realpath(os.path.expanduser(str(req.get("media") or "")))
+        if not os.path.isdir(media):
+            return self._err(400, "not a directory: %s" % media)
+        if not os.access(media, os.R_OK):
+            return self._err(400, "not readable: %s" % media)
+        self.server.media_root = media
+        cfg = load_config()
+        cfg["media"] = media
+        save_config(cfg)
+        return self.api_get_config()
+
     def api_browse(self, q):
         target = self._safe((q.get("path") or [None])[0])
         if not target or not os.path.isdir(target):
@@ -669,6 +772,9 @@ class Handler(BaseHTTPRequestHandler):
             store.put(item)
             return self._json({"id": item_id, "status": "rejected", "reason": "no audio selected"})
 
+        if plan["video"].get("tag"):
+            item["notes"].append("Video tagged %s (ffmpeg's default hev1 will not decode on "
+                                 "the Apple TV)" % plan["video"]["tag"])
         for d in plan["dropped_subs"]:
             item["notes"].append("Dropped subtitle #%d (%s, %s): %s" %
                                  (d["index"], d["codec"], d["language"] or "und", d["reason"]))
@@ -803,9 +909,18 @@ th{color:var(--mut);font-weight:500;font-size:12px}
 code{font:12px ui-monospace,monospace;color:var(--mut);word-break:break-all}
 .note{font-size:12px;color:var(--mut)}
 </style>
-<header>atvcast <span class="mut">— remux only, never re-encodes video</span></header>
+<header>atvcast <span class="mut">— remux only, never re-encodes video</span>
+  <span id="atv" class="pill" style="float:right;font-weight:400"></span></header>
 <div class="wrap">
   <div>
+    <div class="card">
+      <h2>Media folder</h2>
+      <div style="display:flex;gap:6px">
+        <input id="mediaIn" style="flex:1" placeholder="/home/you/Videos">
+        <button class="sec" onclick="setMedia()">Use</button>
+      </div>
+      <div id="mediaMsg" class="note" style="margin-top:6px"></div>
+    </div>
     <div class="card">
       <h2>Library folder</h2>
       <div id="crumb" class="mut" style="margin-bottom:8px"></div>
@@ -863,6 +978,7 @@ function render(){
   let h = '<h2>'+esc(d.title)+'</h2>';
   h += '<p class="note">'+esc(v.codec)+' '+(v.profile?esc(v.profile)+" ":"")+v.width+'×'+v.height+
        ' · '+fmtDur(d.duration)+' · video is copied, never re-encoded'+
+       (v.tag? ' · muxed as '+esc(v.tag) : '')+
        (Object.keys(v.color).length? ' · color: '+esc(Object.values(v.color).join(", ")) : ' · no color tags')+'</p>';
   d.warnings.forEach(w=> h += '<p class="warn">⚠ '+esc(w)+'</p>');
 
@@ -943,7 +1059,25 @@ async function poll(){
   }catch(e){}
 }
 function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-browse(""); poll(); setInterval(poll, 1000);
+
+async function loadConfig(){
+  const c = await (await fetch("/api/config")).json();
+  $("#mediaIn").value = c.media;
+  $("#atv").textContent = "Apple TV → " + c.appletv_url;
+  $("#mediaMsg").textContent = "Converted files go to " + c.cache;
+  return c;
+}
+async function setMedia(){
+  const r = await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({media:$("#mediaIn").value})});
+  const d = await r.json();
+  if(d.error){ $("#mediaMsg").innerHTML = '<span class="bad">'+esc(d.error)+'</span>'; return; }
+  $("#mediaMsg").textContent = "Now browsing " + d.media;
+  $("#detail").innerHTML = '<span class="mut">Select a video on the left.</span>';
+  browse("");
+}
+
+loadConfig(); browse(""); poll(); setInterval(poll, 1000);
 </script>
 """
 
@@ -1020,6 +1154,14 @@ def selftest(sample: str | None = None) -> int:
     check("-metadata:s:s:1 language=spa" in s, "external srt language tagged")
     check("-movflags +faststart" in s, "faststart")
     check("-ac:a:0 8" not in s, "never asks eac3 for 7.1")
+    check("-c:v copy -tag:v hvc1" in s, "hevc muxed as hvc1, not hev1")
+
+    dv = dict(FIXTURE)
+    dv["streams"] = [dict(FIXTURE["streams"][0],
+                          side_data_list=[{"side_data_type": "DOVI configuration record"}])] \
+        + FIXTURE["streams"][1:]
+    check(analyze(dv)["video"]["tag"] == "dvh1", "dolby vision hevc muxed as dvh1")
+    check(analyze(HI10P_FIXTURE)["video"]["tag"] is None, "h264 keeps its default avc1 tag")
 
     c2 = " ".join(build_command("/in.mkv", p, "/out.mp4", [], color_override=p["video"]["color"]))
     check("-color_trc smpte2084 -color_primaries bt2020 -colorspace bt2020nc" in c2,
@@ -1043,12 +1185,91 @@ def selftest(sample: str | None = None) -> int:
 # --------------------------------------------------------------------------
 
 
+ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect width="64" height="64" rx="12" fill="#191d23"/>
+<rect x="10" y="16" width="44" height="28" rx="3" fill="#2f81f7"/>
+<rect x="14" y="20" width="36" height="20" rx="2" fill="#0d1117"/>
+<path d="M27 25.5v9l9-4.5z" fill="#2f81f7"/>
+<rect x="24" y="48" width="16" height="3" rx="1.5" fill="#8b949e"/>
+</svg>
+"""
+
+DESKTOP_ENTRY = """[Desktop Entry]
+Type=Application
+Name=atvcast
+GenericName=Apple TV Video Server
+Comment=Remux MKVs for Apple TV and serve them over the LAN
+Exec={exec}
+Icon={icon}
+Terminal=false
+Categories=AudioVideo;Video;Player;Network;
+Keywords=apple;appletv;tv;video;mkv;mp4;remux;ffmpeg;cast;stream;server;
+StartupNotify=true
+"""
+
+
+def install_desktop() -> int:
+    """Install as a launchable, searchable desktop app for the current user."""
+    bin_dir = os.path.expanduser("~/.local/bin")
+    app_dir = os.path.expanduser("~/.local/share/applications")
+    icon_dir = os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps")
+    for d in (bin_dir, app_dir, icon_dir):
+        os.makedirs(d, exist_ok=True)
+
+    target = os.path.join(bin_dir, "atvcast")
+    source = os.path.realpath(__file__)
+    if source != os.path.realpath(target):
+        shutil.copyfile(source, target)
+    os.chmod(target, 0o755)
+
+    icon_path = os.path.join(icon_dir, "atvcast.svg")
+    with open(icon_path, "w", encoding="utf-8") as fh:
+        fh.write(ICON_SVG)
+
+    entry_path = os.path.join(app_dir, "atvcast.desktop")
+    with open(entry_path, "w", encoding="utf-8") as fh:
+        # Absolute interpreter + script: the desktop launcher does not
+        # necessarily inherit a shell PATH that contains ~/.local/bin.
+        fh.write(DESKTOP_ENTRY.format(exec="%s %s" % (sys.executable, target), icon="atvcast"))
+    os.chmod(entry_path, 0o755)
+
+    if shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", app_dir],
+                       capture_output=True, check=False)
+
+    print("installed:")
+    print("  launcher  %s" % target)
+    print("  entry     %s" % entry_path)
+    print("  icon      %s" % icon_path)
+    print("\nSearch your applications for 'atvcast'. It opens in your browser;")
+    print("pick the media folder there. No terminal needed.")
+    if not shutil.which("ffmpeg"):
+        print("\nwarning: ffmpeg is not on PATH - install it with: sudo apt install ffmpeg")
+    return 0
+
+
+def uninstall_desktop() -> int:
+    for path in (os.path.expanduser("~/.local/bin/atvcast"),
+                 os.path.expanduser("~/.local/share/applications/atvcast.desktop"),
+                 os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps/atvcast.svg")):
+        try:
+            os.remove(path)
+            print("removed %s" % path)
+        except FileNotFoundError:
+            pass
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Remux MKVs for Apple TV and serve them over HTTP.")
-    ap.add_argument("--media", default=os.path.expanduser("~/Videos"), help="media root")
-    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--media", help="media root (default: remembered, else ~/Videos)")
+    ap.add_argument("--port", type=int, help="default: remembered, else %d" % DEFAULT_PORT)
     ap.add_argument("--cache", default=os.path.expanduser("~/.cache/atvcast"))
     ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--no-browser", action="store_true", help="do not open the UI on start")
+    ap.add_argument("--install-desktop", action="store_true",
+                    help="install as a searchable desktop app and exit")
+    ap.add_argument("--uninstall-desktop", action="store_true")
     ap.add_argument("--selftest", action="store_true",
                     help="run the ffprobe decision-logic sanity check and exit")
     ap.add_argument("--sample", help="optional real media file for --selftest")
@@ -1056,30 +1277,53 @@ def main() -> int:
 
     if args.selftest:
         return selftest(args.sample)
+    if args.install_desktop:
+        return install_desktop()
+    if args.uninstall_desktop:
+        return uninstall_desktop()
 
-    for tool in ("ffmpeg", "ffprobe"):
-        if not shutil.which(tool):
-            sys.exit("error: %s not found on PATH" % tool)
+    cfg = load_config()
+    missing = [t for t in ("ffmpeg", "ffprobe") if not shutil.which(t)]
+    if missing:
+        sys.exit("error: %s not found on PATH.\n"
+                 "       install with: sudo apt install ffmpeg" % " and ".join(missing))
 
-    media = os.path.realpath(os.path.expanduser(args.media))
-    if not os.path.isdir(media):
-        sys.exit("error: --media %s is not a directory" % media)
+    # Media root: flag, then remembered, then ~/Videos, then $HOME. Never exit
+    # over it - it is changeable in the UI.
+    for candidate in (args.media, cfg.get("media"), "~/Videos", "~"):
+        if not candidate:
+            continue
+        media = os.path.realpath(os.path.expanduser(candidate))
+        if os.path.isdir(media):
+            break
+    else:
+        media = os.path.expanduser("~")
+
     cache = os.path.realpath(os.path.expanduser(args.cache))
     os.makedirs(cache, exist_ok=True)
+
+    port = free_port(args.port or cfg.get("port") or DEFAULT_PORT)
+    save_config({"media": media, "port": port})
 
     store = Store(cache)
     worker = Converter(store)
     worker.start()
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    httpd = ThreadingHTTPServer((args.host, port), Handler)
     httpd.daemon_threads = True
     httpd.media_root = media
     httpd.store = store
     httpd.worker = worker
 
-    print("atvcast: media=%s cache=%s" % (media, cache))
-    print("         http://%s:%d/   (library: /library, media: /media/{id}.mp4)" %
-          (args.host, args.port))
+    local = "http://127.0.0.1:%d/" % port
+    print("atvcast  media=%s  cache=%s" % (media, cache))
+    print("  this laptop : %s" % local)
+    print("  apple tv    : http://%s:%d" % (lan_ip(), port))
+    print("  ctrl-c to stop")
+
+    if not args.no_browser:
+        threading.Timer(0.6, lambda: webbrowser.open(local)).start()
+
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
