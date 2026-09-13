@@ -111,6 +111,21 @@ def free_port(preferred: int) -> int:
     return preferred
 
 
+def already_running(port: int) -> dict | None:
+    """An atvcast already serving on this port, if any.
+
+    Launching the desktop icon twice must not start a second server: two
+    instances mean two libraries, and the Apple TV only ever talks to one.
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/api/config" % port, timeout=1.5) as r:
+            data = json.load(r)
+        return data if isinstance(data, dict) and "appletv_url" in data else None
+    except Exception:
+        return None
+
+
 def lan_ip() -> str:
     """The address the Apple TV should use. No packet is actually sent."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -423,6 +438,7 @@ class Store:
         self.index_path = os.path.join(cache_dir, "index.json")
         self.lock = threading.RLock()
         self.items: dict = {}
+        self._mtime = 0.0
         self._load()
 
     def _load(self):
@@ -437,10 +453,25 @@ class Store:
             self.items = {}
 
     def save(self):
+        """Merge with whatever is on disk before writing.
+
+        A second atvcast instance loads the index at its own startup; if either
+        then wrote only its in-memory set, it would delete items the other had
+        converted in the meantime. Ours wins per id, nothing is dropped.
+        """
         with self.lock:
+            merged = {}
+            try:
+                with open(self.index_path, "r", encoding="utf-8") as fh:
+                    for it in json.load(fh):
+                        if isinstance(it, dict) and it.get("id"):
+                            merged[it["id"]] = it
+            except (OSError, ValueError):
+                pass
+            merged.update(self.items)
             tmp = self.index_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(list(self.items.values()), fh, indent=2)
+                json.dump(list(merged.values()), fh, indent=2)
             os.replace(tmp, self.index_path)
 
     def put(self, item: dict):
@@ -463,8 +494,27 @@ class Store:
                 it["notes"].append(text)
                 self.save()
 
+    def _refresh(self):
+        """Pick up items another instance converted, without a restart."""
+        try:
+            mtime = os.path.getmtime(self.index_path)
+        except OSError:
+            return
+        if mtime <= self._mtime:
+            return
+        try:
+            with open(self.index_path, "r", encoding="utf-8") as fh:
+                disk = json.load(fh)
+        except (OSError, ValueError):
+            return
+        for it in disk:
+            if isinstance(it, dict) and it.get("id") and it["id"] not in self.items:
+                self.items[it["id"]] = it
+        self._mtime = mtime
+
     def all(self) -> list:
         with self.lock:
+            self._refresh()
             return sorted(self.items.values(), key=lambda i: i.get("created", 0), reverse=True)
 
     def ready(self) -> list:
@@ -1302,8 +1352,19 @@ def main() -> int:
     cache = os.path.realpath(os.path.expanduser(args.cache))
     os.makedirs(cache, exist_ok=True)
 
-    port = free_port(args.port or cfg.get("port") or DEFAULT_PORT)
-    save_config({"media": media, "port": port})
+    wanted = args.port or cfg.get("port") or DEFAULT_PORT
+    running = already_running(wanted)
+    if running:
+        print("atvcast is already running on port %d - opening that one." % wanted)
+        print("  apple tv : %s" % running.get("appletv_url"))
+        if not args.no_browser:
+            webbrowser.open("http://127.0.0.1:%d/" % wanted)
+        return 0
+
+    port = free_port(wanted)
+    # Remember what was ASKED for, never the fallback: the Apple TV has the
+    # address typed in by hand, and silently drifting it breaks playback.
+    save_config({"media": media, "port": wanted})
 
     store = Store(cache)
     worker = Converter(store)
@@ -1319,6 +1380,11 @@ def main() -> int:
     print("atvcast  media=%s  cache=%s" % (media, cache))
     print("  this laptop : %s" % local)
     print("  apple tv    : http://%s:%d" % (lan_ip(), port))
+    print("  library     : %d ready item(s)" % len(store.ready()))
+    if port != wanted:
+        print("  WARNING: port %d was busy, so this instance is on %d." % (wanted, port))
+        print("           Point the Apple TV app at :%d, or stop whatever holds "
+              ":%d and restart." % (port, wanted))
     print("  ctrl-c to stop")
 
     if not args.no_browser:
