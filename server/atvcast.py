@@ -70,9 +70,62 @@ SRT_ENCODING_ORDER = ["utf-8", "cp1252", "latin-1"]
 
 CHUNK = 256 * 1024
 
-CONFIG_DIR = os.path.expanduser("~/.config/atvcast")
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    CONFIG_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "atvcast")
+    DEFAULT_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                                 "atvcast", "cache")
+else:
+    CONFIG_DIR = os.path.expanduser("~/.config/atvcast")
+    DEFAULT_CACHE = os.path.expanduser("~/.cache/atvcast")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 DEFAULT_PORT = 8080
+
+# Resolved at startup by find_tools(); the bare names keep --selftest honest.
+FFMPEG = "ffmpeg"
+FFPROBE = "ffprobe"
+
+
+def find_tool(name: str, extra_dirs: list) -> str | None:
+    """PATH first, then the places a Windows user drops an ffmpeg zip."""
+    exe = name + (".exe" if WINDOWS else "")
+    found = shutil.which(name)
+    if found:
+        return found
+    here = os.path.dirname(os.path.realpath(sys.argv[0] or __file__))
+    candidates = list(extra_dirs) + [here, os.path.join(here, "ffmpeg"),
+                                     os.path.join(here, "ffmpeg", "bin"), os.path.join(here, "bin")]
+    if WINDOWS:
+        local = os.environ.get("LOCALAPPDATA", "")
+        candidates += [os.path.join(local, "Microsoft", "WinGet", "Links"),
+                       r"C:\ffmpeg\bin", r"C:\ffmpeg",
+                       os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                                    "ffmpeg", "bin")]
+        # winget installs Gyan.FFmpeg under a versioned folder; glob it.
+        import glob
+        candidates += glob.glob(os.path.join(local, "Microsoft", "WinGet", "Packages",
+                                             "Gyan.FFmpeg*", "ffmpeg-*", "bin"))
+    for d in candidates:
+        p = os.path.join(d, exe)
+        if d and os.path.isfile(p):
+            return p
+    return None
+
+
+def find_tools(cfg: dict) -> list:
+    """Point FFMPEG/FFPROBE at real binaries. Returns the names still missing."""
+    global FFMPEG, FFPROBE
+    extra = [cfg["ffmpeg_dir"]] if cfg.get("ffmpeg_dir") else []
+    missing = []
+    for name in ("ffmpeg", "ffprobe"):
+        p = find_tool(name, extra)
+        if not p:
+            missing.append(name)
+        elif name == "ffmpeg":
+            FFMPEG = p
+        else:
+            FFPROBE = p
+    return missing
 
 
 # --------------------------------------------------------------------------
@@ -102,7 +155,12 @@ def free_port(preferred: int) -> int:
     busy 8080 does not stop the app from launching."""
     for port in range(preferred, preferred + 25):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if WINDOWS:
+                # SO_REUSEADDR on Winsock lets the probe bind a port that is
+                # actually in use, so it would never detect a collision.
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 s.bind(("0.0.0.0", port))
                 return port
@@ -145,8 +203,11 @@ def lan_ip() -> str:
 
 def ffprobe(path: str) -> dict:
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path],
-        capture_output=True, text=True, check=True,
+        [FFPROBE, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path],
+        capture_output=True, check=True,
+        # ffprobe emits UTF-8 regardless of the console code page; letting
+        # text=True pick cp1252 on Windows turns titles into mojibake or a crash.
+        encoding="utf-8", errors="replace",
     )
     return json.loads(out.stdout)
 
@@ -205,22 +266,37 @@ def plan_audio(streams: list, selected: set | None = None) -> list:
     for ordinal, s in enumerate(a for a in streams if a.get("codec_type") == "audio"):
         codec = (s.get("codec_name") or "").lower()
         channels = int(s.get("channels") or 2)
+        profile = str(s.get("profile") or "")
+        # ffprobe >= 6.1 reports "Dolby Digital Plus + Dolby Atmos" / "Dolby
+        # TrueHD + Dolby Atmos" as the profile when a JOC/Atmos substream exists.
+        atmos = "atmos" in profile.lower()
         lang, label = resolve_track_identity(s, ordinal)
         copyable = codec in AUDIO_COPY_CODECS
         target = min(channels, EAC3_MAX_CHANNELS)  # eac3 encoder tops out at 6
+        if copyable:
+            note = ("Dolby Atmos in E-AC-3 (JOC): copied bit-exact, Atmos preserved"
+                    if atmos else "")
+        elif atmos:
+            note = ("%s Atmos -> eac3 %dch: Atmos objects are LOST. The Apple TV cannot "
+                    "decode %s and no open-source encoder can write Atmos; only the %d.1 "
+                    "bed survives." % (codec, target, codec, target - 1))
+        else:
+            note = "%s -> eac3 %dch%s" % (
+                codec or "unknown", target,
+                " (downmixed from %d, eac3 caps at 6)" % channels if channels > EAC3_MAX_CHANNELS else "")
         plan.append({
             "index": int(s["index"]),
             "ordinal": ordinal,
             "codec": codec,
+            "profile": profile,
+            "atmos": atmos,
             "channels": channels,
             "language": lang,
             "label": label,
             "selected": True if selected is None else int(s["index"]) in selected,
             "action": "copy" if copyable else "transcode",
             "target_channels": channels if copyable else target,
-            "note": "" if copyable else "%s -> eac3 %dch%s" % (
-                codec or "unknown", target,
-                " (downmixed from %d, eac3 caps at 6)" % channels if channels > EAC3_MAX_CHANNELS else ""),
+            "note": note,
         })
     return plan
 
@@ -259,6 +335,15 @@ def analyze(probe: dict, audio_sel=None, sub_sel=None) -> dict:
         warnings.append("1 audio track needs transcoding (eac3); video is still copied.")
     if not audio:
         warnings.append("File has no audio streams.")
+    lost = [a for a in audio if a["selected"] and a["atmos"] and a["action"] == "transcode"]
+    kept = [a for a in audio if a["selected"] and a["atmos"] and a["action"] == "copy"]
+    if lost:
+        warnings.append("Atmos will be lost on %d track(s) (%s): only E-AC-3 Atmos survives a "
+                        "remux, TrueHD Atmos becomes plain 5.1." %
+                        (len(lost), ", ".join(sorted({a["codec"] for a in lost}))))
+    if kept:
+        warnings.append("Atmos preserved on %d E-AC-3 track(s) - verified again after muxing."
+                        % len(kept))
     return {
         "reject": reject,
         "duration": float(fmt.get("duration") or 0.0),
@@ -365,7 +450,7 @@ def sniff_srt(path: str, workdir: str) -> tuple[str, str, str]:
 def build_command(source: str, plan: dict, out_path: str, ext_subs: list,
                   color_override: dict | None = None) -> list:
     """Remux-only command. Video is always copied; audio is per-track."""
-    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error", "-progress", "pipe:1",
+    cmd = [FFMPEG, "-hide_banner", "-nostdin", "-y", "-v", "error", "-progress", "pipe:1",
            "-i", source]
 
     for e in ext_subs:
@@ -556,7 +641,7 @@ class Converter(threading.Thread):
 
     def _exec(self, item_id: str, cmd: list, duration: float) -> tuple[int, str]:
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     text=True, bufsize=1)
+                                     encoding="utf-8", errors="replace", bufsize=1)
         err_tail: list = []
 
         def drain_err():
@@ -626,8 +711,36 @@ class Converter(threading.Thread):
                 self.store.note(item_id, "HDR metadata (%s) survived the mux" %
                                 src_color.get("color_transfer"))
 
+        self._verify_atmos(item_id, job["plan"], job["output"])
+
         size = os.path.getsize(job["output"]) if os.path.exists(job["output"]) else 0
         self.store.update(item_id, status="ready", progress=100.0, size=size)
+
+    def _verify_atmos(self, item_id: str, plan: dict, output: str):
+        """Re-probe the MP4: does each copied E-AC-3 Atmos track still read as
+        Atmos? Copy is bit-exact, so this catches a muxer that dropped the JOC
+        signalling, which the Apple TV would then play as plain DD+ 5.1."""
+        wanted = [a for a in plan["audio"] if a["selected"] and a["atmos"] and a["action"] == "copy"]
+        if not wanted:
+            return
+        try:
+            out_audio = [s for s in ffprobe(output)["streams"] if s.get("codec_type") == "audio"]
+        except Exception as exc:
+            self.store.note(item_id, "Could not re-probe output for Atmos: %s" % exc)
+            return
+        selected = [a for a in plan["audio"] if a["selected"]]
+        for oi, a in enumerate(selected):
+            if not (a["atmos"] and a["action"] == "copy"):
+                continue
+            prof = str(out_audio[oi].get("profile") or "") if oi < len(out_audio) else ""
+            if "atmos" in prof.lower():
+                self.store.note(item_id, "Audio #%d: Atmos verified in the MP4 (%s)" %
+                                (a["index"], prof))
+            else:
+                self.store.note(item_id, "Audio #%d: Atmos NOT detected in the MP4 (reads as "
+                                         "'%s'); the Apple TV will show Dolby Digital Plus 5.1. "
+                                         "Newer ffmpeg (7.x) writes the JOC flag." %
+                                (a["index"], prof or "eac3"))
 
 
 # --------------------------------------------------------------------------
@@ -670,7 +783,10 @@ class Handler(BaseHTTPRequestHandler):
         if not raw:
             return root
         p = os.path.realpath(os.path.join(root, os.path.expanduser(raw)))
-        if p == root or p.startswith(root + os.sep):
+        # normcase: Windows paths are case-insensitive and a drive root already
+        # ends in a separator, so join(root, "") is the right prefix.
+        np_, nr = os.path.normcase(p), os.path.normcase(root)
+        if np_ == nr or np_.startswith(os.path.join(nr, "")):
             return p
         return None
 
@@ -687,6 +803,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.api_convert()
         if u.path == "/api/config":
             return self.api_set_config()
+        if u.path == "/api/install":
+            return self.api_install()
         return self._err(404, "not found")
 
     def _route(self):
@@ -725,7 +843,26 @@ class Handler(BaseHTTPRequestHandler):
             "port": self.server.server_address[1],
             "appletv_url": "http://%s:%d" % (lan_ip(), self.server.server_address[1]),
             "home": os.path.expanduser("~"),
+            "os": "windows" if WINDOWS else sys.platform,
+            "installed": shortcut_installed(),
+            "ffmpeg": FFMPEG,
         })
+
+    def api_install(self):
+        """Create the Start Menu / applications-menu shortcut from the UI, so
+        the first run is a double-click on the script and nothing else."""
+        import io
+        buf = io.StringIO()
+        real = sys.stdout
+        sys.stdout = buf
+        try:
+            rc = install_desktop()
+        except Exception as exc:
+            rc, _ = 1, buf.write("install failed: %s" % exc)
+        finally:
+            sys.stdout = real
+        return self._json({"ok": rc == 0, "log": buf.getvalue(),
+                           "installed": shortcut_installed()}, 200 if rc == 0 else 500)
 
     def api_set_config(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -970,6 +1107,10 @@ code{font:12px ui-monospace,monospace;color:var(--mut);word-break:break-all}
         <button class="sec" onclick="setMedia()">Use</button>
       </div>
       <div id="mediaMsg" class="note" style="margin-top:6px"></div>
+      <div id="installRow" hidden style="margin-top:10px">
+        <button class="sec" id="installBtn" onclick="installApp()">Add to Start Menu</button>
+        <div id="installMsg" class="note" style="margin-top:6px;white-space:pre-wrap"></div>
+      </div>
     </div>
     <div class="card">
       <h2>Library folder</h2>
@@ -1035,9 +1176,11 @@ function render(){
   h += '<h2 style="margin-top:14px">Audio</h2><table><tr><th></th><th>#</th><th>Codec</th><th>Ch</th><th>Lang</th><th>Title</th><th>Action</th></tr>';
   d.audio.forEach(a=>{
     h += '<tr><td><input type="checkbox" class="ain" data-i="'+a.index+'" '+(a.selected?"checked":"")+'></td>'+
-      '<td>'+a.index+'</td><td>'+esc(a.codec)+'</td><td>'+a.channels+'</td>'+
+      '<td>'+a.index+'</td><td>'+esc(a.codec)+(a.atmos?' <span class="pill '+(a.action==="copy"?"ok":"bad")+'">Atmos</span>':'')+
+      '</td><td>'+a.channels+'</td>'+
       '<td>'+(a.language?esc(a.language):'<span class="warn">untagged</span>')+'</td><td>'+esc(a.label)+'</td>'+
-      '<td>'+(a.action==="copy"?'<span class="ok">copy</span>':'<span class="warn">'+esc(a.note)+'</span>')+'</td></tr>';
+      '<td>'+(a.action==="copy"?'<span class="ok">copy</span>'+(a.note?' <span class="note">'+esc(a.note)+'</span>':'')
+                                :'<span class="'+(a.atmos?"bad":"warn")+'">'+esc(a.note)+'</span>')+'</td></tr>';
   });
   if(!d.audio.length) h += '<tr><td colspan="7" class="mut">none</td></tr>';
   h += '</table><p class="note">First checked track is marked default. Untagged tracks show as Unknown on the Apple TV.</p>';
@@ -1115,7 +1258,15 @@ async function loadConfig(){
   $("#mediaIn").value = c.media;
   $("#atv").textContent = "Apple TV → " + c.appletv_url;
   $("#mediaMsg").textContent = "Converted files go to " + c.cache;
+  $("#installRow").hidden = !!c.installed;
+  $("#installBtn").textContent = c.os === "windows" ? "Add to Start Menu" : "Add to applications menu";
   return c;
+}
+async function installApp(){
+  $("#installBtn").disabled = true;
+  const d = await (await fetch("/api/install",{method:"POST"})).json();
+  $("#installMsg").textContent = d.log || (d.ok ? "installed" : "failed");
+  if(d.installed) $("#installBtn").hidden = true; else $("#installBtn").disabled = false;
 }
 async function setMedia(){
   const r = await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -1155,6 +1306,19 @@ FIXTURE = {
     ],
 }
 
+ATMOS_FIXTURE = {
+    "format": {"duration": "100"},
+    "streams": [
+        {"index": 0, "codec_type": "video", "codec_name": "hevc", "profile": "Main 10"},
+        {"index": 1, "codec_type": "audio", "codec_name": "eac3", "channels": 6,
+         "profile": "Dolby Digital Plus + Dolby Atmos", "tags": {"language": "eng"}},
+        {"index": 2, "codec_type": "audio", "codec_name": "truehd", "channels": 8,
+         "profile": "Dolby TrueHD + Dolby Atmos", "tags": {"language": "eng"}},
+        {"index": 3, "codec_type": "audio", "codec_name": "eac3", "channels": 6,
+         "tags": {"language": "deu"}},
+    ],
+}
+
 HI10P_FIXTURE = {
     "format": {"duration": "600"},
     "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264", "profile": "High 10",
@@ -1188,6 +1352,21 @@ def selftest(sample: str | None = None) -> int:
 
     r = analyze(HI10P_FIXTURE)
     check(r["reject"] == "Hi10P not supported by Apple TV", "Hi10P rejected")
+
+    at = analyze(ATMOS_FIXTURE)
+    check([a["atmos"] for a in at["audio"]] == [True, True, False], "Atmos detected from profile")
+    check(at["audio"][0]["action"] == "copy" and "preserved" in at["audio"][0]["note"],
+          "E-AC-3 Atmos is copied and reported as preserved")
+    check(at["audio"][1]["action"] == "transcode" and "LOST" in at["audio"][1]["note"],
+          "TrueHD Atmos is transcoded and reported as lost")
+    check(any("Atmos will be lost" in w for w in at["warnings"]), "Atmos-loss warning raised")
+    ac = " ".join(build_command("/a.mkv", at, "/a.mp4", []))
+    check("-c:a:0 copy" in ac and "-c:a:1 eac3 -b:a:1 768k -ac:a:1 6" in ac,
+          "Atmos E-AC-3 copied, TrueHD Atmos -> eac3 6ch")
+
+    ico = render_icon_ico(32)
+    check(ico[:6] == b"\x00\x00\x01\x00\x01\x00" and ico[22:30] == b"\x89PNG\r\n\x1a\n",
+          "windows icon renders as PNG-in-ICO")
 
     cmd = build_command("/in.mkv", p, "/out.mp4",
                         [{"path": "/x.srt", "charenc": "CP1252", "offset": 2.5, "lang": "spa",
@@ -1258,7 +1437,150 @@ StartupNotify=true
 """
 
 
+def render_icon_ico(size: int = 128) -> bytes:
+    """Same picture as ICON_SVG, rasterised into a PNG-in-ICO with only zlib and
+    struct - no image library on Windows either."""
+    import struct
+    import zlib
+
+    bg, blue, dark, grey = (25, 29, 35), (47, 129, 247), (13, 17, 23), (139, 148, 158)
+    s = size / 64.0  # the SVG is drawn on a 64-unit grid
+
+    def in_round_rect(x, y, x0, y0, w, h, r):
+        if not (x0 <= x < x0 + w and y0 <= y < y0 + h):
+            return False
+        cx = min(max(x, x0 + r), x0 + w - r)
+        cy = min(max(y, y0 + r), y0 + h - r)
+        return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+
+    rows = []
+    for py in range(size):
+        row = bytearray()
+        for px in range(size):
+            x, y = (px + 0.5) / s, (py + 0.5) / s
+            if not in_round_rect(x, y, 0, 0, 64, 64, 12):
+                row += b"\x00\x00\x00\x00"
+                continue
+            c = bg
+            if in_round_rect(x, y, 10, 16, 44, 28, 3):
+                c = blue
+            if in_round_rect(x, y, 14, 20, 36, 20, 2):
+                c = dark
+            # play triangle: (27,25.5) (27,34.5) (36,30)
+            if 27 <= x <= 36 and abs(y - 30) <= 4.5 * (1 - (x - 27) / 9.0):
+                c = blue
+            if in_round_rect(x, y, 24, 48, 16, 3, 1.5):
+                c = grey
+            row += bytes(c) + b"\xff"
+        rows.append(bytes(row))
+
+    def chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(b"".join(b"\x00" + r for r in rows), 9))
+           + chunk(b"IEND", b""))
+    header = struct.pack("<HHH", 0, 1, 1)
+    entry = struct.pack("<BBBBHHII", size % 256, size % 256, 0, 0, 1, 32, len(png), 22)
+    return header + entry + png
+
+
+def _ps_quote(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def install_windows() -> int:
+    """Start Menu shortcut (searchable from the Start key) that launches the
+    server with pythonw.exe, so no console window appears."""
+    local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    app_dir = os.path.join(local, "atvcast")
+    os.makedirs(app_dir, exist_ok=True)
+
+    target = os.path.join(app_dir, "atvcast.py")
+    source = os.path.realpath(__file__)
+    if os.path.normcase(source) != os.path.normcase(target):
+        shutil.copyfile(source, target)
+
+    icon = os.path.join(app_dir, "atvcast.ico")
+    with open(icon, "wb") as fh:
+        fh.write(render_icon_ico())
+
+    # Remember where ffmpeg was found, in case it lives next to the original
+    # script rather than on PATH; the installed copy would not see it there.
+    cfg = load_config()
+    missing = find_tools(cfg)
+    if not missing:
+        cfg["ffmpeg_dir"] = os.path.dirname(FFMPEG)
+        save_config(cfg)
+
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.isfile(pyw):
+        pyw = sys.executable
+    start_menu = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
+                              "Microsoft", "Windows", "Start Menu", "Programs")
+    os.makedirs(start_menu, exist_ok=True)
+    lnk = os.path.join(start_menu, "atvcast.lnk")
+
+    script = (
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut(%s); "
+        "$s.TargetPath = %s; $s.Arguments = %s; $s.WorkingDirectory = %s; "
+        "$s.IconLocation = %s; $s.Description = 'Remux MKVs for Apple TV'; $s.Save()"
+        % (_ps_quote(lnk), _ps_quote(pyw), _ps_quote('"%s"' % target),
+           _ps_quote(app_dir), _ps_quote(icon)))
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+                        "Bypass", "-Command", script], capture_output=True, text=True)
+    if r.returncode != 0:
+        print("could not create the Start Menu shortcut:\n%s" % (r.stderr or r.stdout))
+        return 1
+
+    print("installed:")
+    print("  app       %s" % target)
+    print("  shortcut  %s" % lnk)
+    print("  icon      %s" % icon)
+    print("  log       %s" % os.path.join(CONFIG_DIR, "atvcast.log"))
+    print("\nPress the Windows key, type 'atvcast', press Enter. The browser opens;")
+    print("pick the media folder there.")
+    print("\nThe FIRST launch pops a Windows Defender Firewall dialog for Python -")
+    print("tick 'Private networks' and click Allow, or the Apple TV cannot connect.")
+    if missing:
+        print("\nwarning: %s not found. Install with:  winget install Gyan.FFmpeg"
+              % " and ".join(missing))
+        print("         (or unzip an ffmpeg build to C:\\ffmpeg\\bin), then relaunch.")
+    return 0
+
+
+def uninstall_windows() -> int:
+    local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    for path in (os.path.join(os.environ.get("APPDATA") or "", "Microsoft", "Windows",
+                              "Start Menu", "Programs", "atvcast.lnk"),
+                 os.path.join(local, "atvcast", "atvcast.py"),
+                 os.path.join(local, "atvcast", "atvcast.ico")):
+        try:
+            os.remove(path)
+            print("removed %s" % path)
+        except (FileNotFoundError, OSError):
+            pass
+    return 0
+
+
+def shortcut_installed() -> bool:
+    if WINDOWS:
+        return os.path.isfile(os.path.join(os.environ.get("APPDATA") or "", "Microsoft",
+                                           "Windows", "Start Menu", "Programs", "atvcast.lnk"))
+    return os.path.isfile(os.path.expanduser("~/.local/share/applications/atvcast.desktop"))
+
+
 def install_desktop() -> int:
+    return install_windows() if WINDOWS else install_linux()
+
+
+def uninstall_desktop() -> int:
+    return uninstall_windows() if WINDOWS else uninstall_linux()
+
+
+def install_linux() -> int:
     """Install as a launchable, searchable desktop app for the current user."""
     bin_dir = os.path.expanduser("~/.local/bin")
     app_dir = os.path.expanduser("~/.local/share/applications")
@@ -1298,7 +1620,7 @@ def install_desktop() -> int:
     return 0
 
 
-def uninstall_desktop() -> int:
+def uninstall_linux() -> int:
     for path in (os.path.expanduser("~/.local/bin/atvcast"),
                  os.path.expanduser("~/.local/share/applications/atvcast.desktop"),
                  os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps/atvcast.svg")):
@@ -1314,7 +1636,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Remux MKVs for Apple TV and serve them over HTTP.")
     ap.add_argument("--media", help="media root (default: remembered, else ~/Videos)")
     ap.add_argument("--port", type=int, help="default: remembered, else %d" % DEFAULT_PORT)
-    ap.add_argument("--cache", default=os.path.expanduser("~/.cache/atvcast"))
+    ap.add_argument("--cache", default=DEFAULT_CACHE)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--no-browser", action="store_true", help="do not open the UI on start")
     ap.add_argument("--install-desktop", action="store_true",
@@ -1332,11 +1654,29 @@ def main() -> int:
     if args.uninstall_desktop:
         return uninstall_desktop()
 
+    # Under pythonw.exe (the Start Menu shortcut) there is no console at all:
+    # stdout/stderr are None and a traceback would vanish. Log to a file.
+    if sys.stdout is None or sys.stderr is None:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        log_path = os.path.join(CONFIG_DIR, "atvcast.log")
+        try:
+            if os.path.getsize(log_path) > 5 * 1024 * 1024:
+                os.remove(log_path)
+        except OSError:
+            pass
+        sys.stdout = sys.stderr = open(log_path, "a", encoding="utf-8", buffering=1)
+
     cfg = load_config()
-    missing = [t for t in ("ffmpeg", "ffprobe") if not shutil.which(t)]
+    missing = find_tools(cfg)
     if missing:
-        sys.exit("error: %s not found on PATH.\n"
-                 "       install with: sudo apt install ffmpeg" % " and ".join(missing))
+        hint = ("winget install Gyan.FFmpeg   (or unzip a build to C:\\ffmpeg\\bin)" if WINDOWS
+                else "sudo apt install ffmpeg")
+        msg = "error: %s not found.\n       install with: %s" % (" and ".join(missing), hint)
+        if WINDOWS and not args.no_browser:
+            # No console to read the error in; show it in the browser instead.
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, msg.replace("error: ", ""), "atvcast", 0x10)
+        sys.exit(msg)
 
     # Media root: flag, then remembered, then ~/Videos, then $HOME. Never exit
     # over it - it is changeable in the UI.
